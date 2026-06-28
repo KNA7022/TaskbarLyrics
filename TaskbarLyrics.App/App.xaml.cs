@@ -1,4 +1,6 @@
 using System.IO;
+using System.IO.Pipes;
+using System.Threading;
 using System.Windows;
 using Microsoft.Win32;
 
@@ -6,11 +8,16 @@ namespace TaskbarLyrics.App;
 
 public partial class App : System.Windows.Application
 {
+    private const string SingleInstanceMutexName = @"Local\ANYNC.TaskbarLyrics.SingleInstance";
+    private const string ActivationPipeName = "ANYNC.TaskbarLyrics.Activation";
     private SettingsStore? _settingsStore;
     private TrayService? _trayService;
     private SettingsWindow? _settingsWindow;
     private SpectrumTuningWindow? _spectrumTuningWindow;
     private LyricsWindowHost? _lyricsWindowHost;
+    private Mutex? _singleInstanceMutex;
+    private bool _ownsSingleInstanceMutex;
+    private CancellationTokenSource? _activationServerCancellation;
     private SpectrumTuningSettings _spectrumTuningSettings = SpectrumTuningSettings.CreateDefault();
 
     public AppSettings Settings { get; private set; } = new();
@@ -20,6 +27,15 @@ public partial class App : System.Windows.Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out var isFirstInstance);
+        _ownsSingleInstanceMutex = isFirstInstance;
+        if (!isFirstInstance)
+        {
+            SignalRunningInstanceAsync().GetAwaiter().GetResult();
+            Shutdown();
+            return;
+        }
+
         base.OnStartup(e);
         Wpf.Ui.Appearance.ApplicationAccentColorManager.ApplySystemAccent();
 
@@ -49,16 +65,25 @@ public partial class App : System.Windows.Application
 
         _lyricsWindowHost.ApplySpectrumTuning(_spectrumTuningSettings);
         _trayService = new TrayService(ToggleLyricsWindow, OpenSettingsWindow, ExitApplication);
+        StartActivationServer();
         SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _activationServerCancellation?.Cancel();
+        _activationServerCancellation?.Dispose();
         SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
         _settingsStore?.Save(Settings);
         _spectrumTuningWindow?.Close();
         _lyricsWindowHost?.Dispose();
         _trayService?.Dispose();
+        if (_ownsSingleInstanceMutex)
+        {
+            _singleInstanceMutex?.ReleaseMutex();
+        }
+
+        _singleInstanceMutex?.Dispose();
         base.OnExit(e);
     }
 
@@ -179,6 +204,11 @@ public partial class App : System.Windows.Application
     {
         if (_settingsWindow is { IsVisible: true })
         {
+            if (_settingsWindow.WindowState == WindowState.Minimized)
+            {
+                _settingsWindow.WindowState = WindowState.Normal;
+            }
+
             _settingsWindow.Activate();
             return;
         }
@@ -186,6 +216,58 @@ public partial class App : System.Windows.Application
         _settingsWindow = new SettingsWindow(Settings.Clone());
         _settingsWindow.Closed += SettingsWindow_Closed;
         _settingsWindow.Show();
+    }
+
+    private void StartActivationServer()
+    {
+        _activationServerCancellation = new CancellationTokenSource();
+        _ = Task.Run(() => ListenForActivationAsync(_activationServerCancellation.Token));
+    }
+
+    private async Task ListenForActivationAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await using var server = new NamedPipeServerStream(
+                    ActivationPipeName,
+                    PipeDirection.In,
+                    maxNumberOfServerInstances: 1,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous);
+
+                await server.WaitForConnectionAsync(cancellationToken);
+                await Dispatcher.InvokeAsync(OpenSettingsWindow);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (IOException)
+            {
+            }
+        }
+    }
+
+    private static async Task SignalRunningInstanceAsync()
+    {
+        try
+        {
+            await using var client = new NamedPipeClientStream(
+                ".",
+                ActivationPipeName,
+                PipeDirection.Out,
+                PipeOptions.Asynchronous);
+
+            await client.ConnectAsync(500);
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (IOException)
+        {
+        }
     }
 
     private void SettingsWindow_Closed(object? sender, EventArgs e)
